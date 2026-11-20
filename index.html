@@ -61,6 +61,11 @@ footer{text-align:center;color:#b9d3bd;font-size:.8rem;padding:10px 20px 30px}
 .pinx{display:block;width:18px;height:18px;border-radius:50%;background:var(--pin);border:2px solid #fff;box-shadow:0 0 4px #0009}
 .leaflet-popup-content-wrapper{background:var(--card);color:var(--ink)}.leaflet-popup-tip{background:var(--card)}
 .leaflet-popup-content{margin:14px 16px;width:280px!important}
+.opt{display:block;font-weight:400;margin:6px 0;font-size:.92rem}.opt input{width:auto;margin-right:8px}
+.pinx.multi{background:var(--blue)}.pinx.sel{background:#e0b184;transform:scale(1.4)}
+.tl{display:flex;flex-wrap:wrap;gap:6px;margin:6px 0 10px}
+.chip{border:1px solid var(--line);background:#fff;color:#000;border-radius:99px;padding:3px 10px;font:inherit;font-size:.75rem;cursor:pointer}
+.chip.on{background:#14711f;color:#fff;border-color:#14711f}
 </style>
 </head>
 <body>
@@ -100,7 +105,9 @@ footer{text-align:center;color:#b9d3bd;font-size:.8rem;padding:10px 20px 30px}
     <h2 class="t">Contribute a sound</h2>
     <p class="hint">Please record only in public places or with consent, and avoid capturing identifiable private conversations.</p>
     <div id="gate" class="hint"></div>
-    <label>1. Pin the location <small>(click the map)</small></label>
+    <label>1. Pin the location</label>
+    <label class="opt"><input type="radio" name="mode" value="new" checked>A new place (click anywhere on the map)</label>
+    <label class="opt"><input type="radio" name="mode" value="again">Another recording of a place already on the map, so listeners can hear how it changed over time (click its pin)</label>
     <div class="mapbox" id="pickMap"></div>
     <p class="hint" id="coord">No location chosen yet.</p>
 
@@ -115,6 +122,9 @@ footer{text-align:center;color:#b9d3bd;font-size:.8rem;padding:10px 20px 30px}
 
     <label for="date">5. Date recorded <small>(required)</small></label>
     <input type="date" id="date">
+
+    <label for="lost">What used to be heard here? <small>(optional, in any language)</small></label>
+    <textarea id="lost" maxlength="800" placeholder="Sounds that are fading or gone, such as birds, water, farming, children playing. Share what you or residents remember."></textarea>
 
     <label for="place">Place name <small>(optional)</small></label>
     <input id="place" maxlength="120" placeholder="Barangay, municipality, province">
@@ -148,34 +158,73 @@ function baseMap(id){
 }
 const map=baseMap('mainMap'),pick=baseMap('pickMap');
 const cluster=L.markerClusterGroup({maxClusterRadius:40}).addTo(map);
-const icon=L.divIcon({className:'',html:'<span class="pinx"></span>',iconSize:[18,18],iconAnchor:[9,9]});
+const sitesLayer=L.layerGroup().addTo(pick);
+const mk=c=>L.divIcon({className:'',html:'<span class="pinx '+c+'"></span>',iconSize:[18,18],iconAnchor:[9,9]});
+const icon=mk(''),iconMulti=mk('multi'),iconSel=mk('sel');
 function el(t,txt,cls){const e=document.createElement(t);if(txt!=null)e.textContent=txt;if(cls)e.className=cls;return e}
-function popup(r){
-  const d=el('div',null,'detail');
-  d.append(el('h2',r.description));
-  d.append(el('div',[r.place,'Recorded '+r.recorded_on,r.alias?'by '+r.alias:''].filter(Boolean).join(' · '),'meta'));
-  const a=document.createElement('audio');a.controls=true;a.preload='none';
-  a.src=sb.storage.from('sounds').getPublicUrl(r.file_path).data.publicUrl;d.append(a);
-  d.append(el('h3','Development project'));d.append(el('p',r.narrative));
-  return d;
+const audioUrl=r=>sb.storage.from('sounds').getPublicUrl(r.file_path).data.publicUrl;
+
+/* popup: one place, one or more recordings over time */
+function popup(rows){
+  const d=el('div',null,'detail'),body=el('div'),n=rows.length,chips=[];
+  if(n>1){
+    d.append(el('div','Then and now · '+n+' recordings of this place','meta'));
+    const tl=el('div',null,'tl');
+    rows.forEach((r,i)=>{
+      const b=el('button',(i===0?'Earliest · ':i===n-1?'Latest · ':'')+r.recorded_on,'chip');
+      b.onclick=()=>show(i);chips.push(b);tl.append(b);
+    });
+    d.append(tl);
+  }
+  d.append(body);
+  function show(i){
+    const r=rows[i];body.innerHTML='';
+    chips.forEach((c,j)=>c.classList.toggle('on',j===i));
+    body.append(el('h2',r.description));
+    body.append(el('div',[r.place,'Recorded '+r.recorded_on,r.alias?'by '+r.alias:''].filter(Boolean).join(' · '),'meta'));
+    const a=document.createElement('audio');a.controls=true;a.preload='none';a.src=audioUrl(r);body.append(a);
+    body.append(el('h3','Development project'));body.append(el('p',r.narrative));
+    if(r.lost_sounds){body.append(el('h3','Sounds that used to be heard here'));body.append(el('p',r.lost_sounds))}
+  }
+  show(0);return d;
 }
+
 const count=document.getElementById('count');
 async function load(){
   if(!sb){count.textContent='Not connected yet. Paste your Supabase URL and key at the top of the script.';return}
-  const {data,error}=await sb.from('sounds').select('*').eq('approved',true);
+  const {data,error}=await sb.from('sounds').select('*').eq('approved',true).order('recorded_on');
   if(error){count.textContent='Could not load recordings.';return}
-  cluster.clearLayers();
-  data.forEach(r=>cluster.addLayer(L.marker([r.lat,r.lng],{icon}).bindPopup(()=>popup(r),{maxWidth:300})));
-  count.textContent=data.length?'Select a pin to listen. '+data.length+' recording'+(data.length>1?'s':'')+' so far.':'No recordings yet. Be the first to contribute a sound.';
+  const g={};data.forEach(r=>{const k=r.site_id||r.id;(g[k]=g[k]||[]).push(r)});
+  const sites=Object.values(g);
+  cluster.clearLayers();sitesLayer.clearLayers();
+  sites.forEach(rows=>{
+    const f=rows[0],ll=[f.lat,f.lng],ic=rows.length>1?iconMulti:icon;
+    cluster.addLayer(L.marker(ll,{icon:ic}).bindPopup(()=>popup(rows),{maxWidth:300}));
+    L.marker(ll,{icon:ic}).on('click',()=>chooseSite(rows)).addTo(sitesLayer);
+  });
+  count.textContent=data.length?'Select a pin to listen. '+sites.length+' place'+(sites.length>1?'s':'')+', '+data.length+' recording'+(data.length>1?'s':'')+'. Blue pins hold recordings made at different times.':'No recordings yet. Be the first to contribute a sound.';
 }
 load();
 
-let picked=null,dot=null;
+/* contribute: pick a new place, or an existing one */
+const mode=()=>document.querySelector('input[name=mode]:checked').value;
+const coord=document.getElementById('coord');
+let picked=null,dot=null,site=null;
+function resetPick(){picked=null;site=null;if(dot)dot.remove();dot=null;coord.textContent=mode()==='again'?'Click an existing pin on the map.':'No location chosen yet.'}
 pick.on('click',e=>{
+  if(mode()==='again')return;
   picked=e.latlng;if(dot)dot.remove();
   dot=L.marker(picked,{icon}).addTo(pick);
-  document.getElementById('coord').textContent='Location set: '+picked.lat.toFixed(3)+'°N, '+picked.lng.toFixed(3)+'°E';
+  coord.textContent='Location set: '+picked.lat.toFixed(3)+'°N, '+picked.lng.toFixed(3)+'°E';
 });
+function chooseSite(rows){
+  if(mode()!=='again')return;
+  site=rows[0].site_id||rows[0].id;picked=L.latLng(rows[0].lat,rows[0].lng);
+  if(dot)dot.remove();dot=L.marker(picked,{icon:iconSel,zIndexOffset:1000}).addTo(pick);
+  const l=rows[rows.length-1];
+  coord.textContent='Adding to: '+l.description+(l.place?' ('+l.place+')':'')+' · '+rows.length+' recording'+(rows.length>1?'s':'')+' so far';
+}
+document.querySelectorAll('input[name=mode]').forEach(r=>r.onchange=resetPick);
 
 document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{
   document.querySelectorAll('nav button').forEach(x=>x.setAttribute('aria-selected',x===b));
@@ -192,8 +241,8 @@ if(!sb)document.getElementById('gate').textContent='Setup needed: connect Supaba
 
 document.getElementById('submit').onclick=async()=>{
   const f=document.getElementById('file').files[0],desc=document.getElementById('desc').value.trim(),
-  narr=document.getElementById('narr').value.trim(),date=dateEl.value;
-  if(!picked)return say('Please click the map to pin the location.','err');
+  narr=document.getElementById('narr').value.trim(),date=dateEl.value,lost=document.getElementById('lost').value.trim();
+  if(!picked)return say(mode()==='again'?'Please click the existing pin you are adding to.':'Please click the map to pin the location.','err');
   if(!f)return say('Please choose a WAV or MP3 file.','err');
   const ext=f.name.split('.').pop().toLowerCase();
   if(!['wav','mp3'].includes(ext))return say('Only WAV or MP3 files are accepted.','err');
@@ -205,13 +254,16 @@ document.getElementById('submit').onclick=async()=>{
     const mime=ext==='wav'?'audio/wav':'audio/mpeg',path=crypto.randomUUID()+'.'+ext;
     const up=await sb.storage.from('sounds').upload(path,f,{contentType:mime});
     if(up.error)throw up.error;
-    const ins=await sb.from('sounds').insert({description:desc,narrative:narr,recorded_on:date,
+    const row={description:desc,narrative:narr,recorded_on:date,
       place:document.getElementById('place').value.trim()||null,alias:document.getElementById('alias').value.trim()||null,
-      lat:picked.lat,lng:picked.lng,file_path:path,mime});
+      lat:picked.lat,lng:picked.lng,file_path:path,mime};
+    if(lost)row.lost_sounds=lost;
+    if(site)row.site_id=site;
+    const ins=await sb.from('sounds').insert(row);
     if(ins.error)throw ins.error;
     say('Thank you! Your recording will appear on the map after review.','ok');
-    ['file','desc','narr','date','place','alias'].forEach(i=>document.getElementById(i).value='');
-    picked=null;if(dot)dot.remove();document.getElementById('coord').textContent='No location chosen yet.';
+    ['file','desc','narr','date','lost','place','alias'].forEach(i=>document.getElementById(i).value='');
+    resetPick();
   }catch(e){say('Upload failed: '+((e&&e.message)||'unknown error'),'err')}
   btn.disabled=false;
 };
